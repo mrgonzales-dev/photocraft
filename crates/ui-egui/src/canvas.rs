@@ -2758,6 +2758,9 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         // Live adjustment previews on big documents use a downsampled proxy (see proxy.rs), unless
         // Preferences › Performance › Low Resolution Previews is off.
         let mut on_gpu = false;
+        // Whether this call refreshed the document's own canvas texture (either path below): a
+        // proxy preview's texture is a different key the stroke catch-up must not touch.
+        let mut doc_display = false;
         // A flipped or pixel-aspect-corrected view draws through the CPU path (the GPU canvas shader
         // has no mirroring or non-square pixels). Rotation stays on the GPU: it is a view uniform.
         let gpu_ok = crate::gpu_canvas::gpu_view_ok(flip, view.rotation, aspect);
@@ -2792,6 +2795,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             paint_gpu_view(&painter, rect, params, &pattern);
         } else if gpu_ok && ensure_gpu(app, idx, visible_doc_rect(&xf)) {
             on_gpu = true;
+            doc_display = true;
             app.perf.gpu = true;
             // Shadow, checkerboard, document and pixel grid in one custom shader (gpu_canvas.rs).
             let params = crate::gpu_canvas::ViewParams {
@@ -2816,6 +2820,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             if !crate::theme::Tokens::get(&ctx).bevel && drop_shadow {
                 painter.add(egui::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(150) }.as_shape(img_rect, 0));
             }
+            doc_display = true;
             let rotated = view.rotation.abs() > 0.05;
             let checkerboard = app.session.prefs().transparency_and_gamut.square().map(|square| (checker(app, &ctx), square));
             let tex = ensure_texture(app, &ctx, idx, output).map(|(tex, _scale)| tex);
@@ -2961,7 +2966,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             }
         }
 
-        (img_rect, beyond, layer_edges)
+        (img_rect, beyond, layer_edges, doc_display)
     };
     let painted = if crop_camera { None } else { Some(paint_canvas(app, ui, &view, xf)) };
     let img_rect = xf.doc_rect(doc.bounds());
@@ -3467,6 +3472,17 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             }
         }
     }
+    // The input above can have fed a live stroke (or committed an edit) after `paint_canvas`
+    // refreshed the canvas texture. Refreshing again puts those pixels in the texture this
+    // frame's paint draws — the GPU view callback and egui's texture upload both resolve at the
+    // end of the frame — so a dab shows in the frame its move arrived in, not one frame late.
+    // Untouched state makes both calls return at their cache-key check.
+    if primary
+        && painted.as_ref().is_some_and(|p| p.3)
+        && !(app.gpu.is_some() && crate::gpu_canvas::gpu_view_ok(flip, view.rotation, aspect) && ensure_gpu(app, idx, visible_doc_rect(&xf)))
+    {
+        let _ = ensure_texture(app, &ctx, idx, output);
+    }
     if crop_camera && let (Some((center, rotation)), Some(now)) = (camera, app.ui.views.get(idx)) {
         if now.center != center {
             view.center = now.center;
@@ -3478,7 +3494,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         }
     }
     let xf = if crop_camera { ViewXform { center: view.center, rotation: view.rotation, ..xf } } else { xf };
-    let (img_rect, beyond, layer_edges) = painted.unwrap_or_else(|| paint_canvas(app, ui, &view, xf));
+    let (img_rect, beyond, layer_edges, _) = painted.unwrap_or_else(|| paint_canvas(app, ui, &view, xf));
     if primary && !(hand_pan && response.dragged()) {
         if app.ui.extras.grid && app.ui.view.extras {
             crate::rulers::draw_grid(app, &painter, &xf, &doc);
