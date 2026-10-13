@@ -888,6 +888,11 @@ impl TransformMode {
 pub struct TransformSession {
     pub session: u64,
     pub layer: u64,
+    /// Every layer the box moves, in bottom-to-top document order, when a multi-selection
+    /// transforms as one (⌘T with several layers selected): `layer` is its key layer. Empty for
+    /// the single-layer, lone-target, path and selection sessions.
+    #[serde(default)]
+    pub layers: Vec<u64>,
     pub rect: [f64; 4],
     /// Corners clockwise from top-left (document px).
     pub quad: [[f64; 2]; 4],

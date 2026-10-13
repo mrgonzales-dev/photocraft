@@ -270,19 +270,38 @@ fn content_frame_warp(mesh: &BezierMesh, c: [f64; 4], b: [f64; 4]) -> Option<War
 /// Largest warp frame side: far above any real layer, far below what would exhaust memory.
 const MAX_WARP_SIDE: u32 = 100_000;
 
-fn target(s: &Session, cmd: &str, p: &Value) -> Result<(LayerId, Rect)> {
+fn target(s: &Session, cmd: &str, p: &Value) -> Result<(Vec<LayerId>, Rect)> {
     let st = s.active().ok_or(EngineError::NoDocument)?;
-    let id = match p.get("layer").and_then(Value::as_u64) {
-        Some(v) => LayerId(v),
-        None => st.active_layer.ok_or(EngineError::Other("no active layer".into()))?,
+    // `"layers"`: a Free Transform warp on a multi-selection warps each layer the same way.
+    let ids: Vec<LayerId> = match p.get("layers").and_then(Value::as_array) {
+        Some(a) => a.iter().filter_map(Value::as_u64).map(LayerId).collect(),
+        None => Vec::new(),
     };
-    let layer = st.doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+    let ids = if ids.is_empty() {
+        vec![match p.get("layer").and_then(Value::as_u64) {
+            Some(v) => LayerId(v),
+            None => st.active_layer.ok_or(EngineError::Other("no active layer".into()))?,
+        }]
+    } else {
+        ids
+    };
+    // A group in the set warps its children: drop repeats and listed descendants, or they warp twice.
+    let mut ids: Vec<LayerId> =
+        ids.iter().copied().filter(|&id| !ids.iter().any(|&o| o != id && st.doc.layer(o).is_some_and(|g| crate::transform_cmds::holds(g, id)))).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err(bad(cmd, "no layer to warp"));
+    }
     let rect = match p.get("rect").and_then(Value::as_array) {
         Some(r) if r.len() == 4 => {
             let v: Vec<i32> = r.iter().map(|x| x.as_f64().unwrap_or(0.0).round() as i32).collect();
             Rect::new(v[0], v[1], v[2], v[3])
         }
-        _ => warp_bounds(&st.doc, layer),
+        _ => ids
+            .iter()
+            .map(|id| st.doc.layer(*id).ok_or(EngineError::NoLayer(*id)).map(|l| warp_bounds(&st.doc, l)))
+            .try_fold(Rect::EMPTY, |a, b| b.map(|b| a.union(&b)))?,
     };
     if rect.is_empty() {
         return Err(bad(cmd, "nothing to warp"));
@@ -291,7 +310,7 @@ fn target(s: &Session, cmd: &str, p: &Value) -> Result<(LayerId, Rect)> {
     if w > MAX_WARP_SIDE || h > MAX_WARP_SIDE {
         return Err(bad(cmd, format!("rect too large for warp: {w} x {h} (max {MAX_WARP_SIDE} per side)")));
     }
-    Ok((id, rect))
+    Ok((ids, rect))
 }
 
 /// The Warp Text settings a transform warp gives a type layer: a preset style (or none) keeps the
@@ -335,42 +354,71 @@ fn warp_type_layer(s: &mut Session, cmd: &str, id: LayerId, w: &Warp) -> Result<
     Ok(json!({"layer": id.0, "changed": true, "warp": tw}))
 }
 
-fn apply(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
-    let (id, rect) = target(s, cmd, p)?;
-    let w = warp_from_params(cmd, p, rect_f(rect))?;
-    if matches!(s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content), Some(LayerContent::Text(_))) {
-        return warp_type_layer(s, cmd, id, &w);
+/// Give the type layer `id` the Warp Text style `tw` (with the lock check [`warp_type_layer`]
+/// does), shared with a multi-layer warp where every type layer in the set takes the style.
+fn set_type_warp(doc: &mut Document, snapshot: &Document, id: LayerId, tw: &Option<photocraft_doc::text::TextWarp>) -> Result<()> {
+    let group = crate::transform_cmds::group_locks(doc, id);
+    let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+    let locks = l.locks.union(group);
+    if locks.position || locks.all {
+        return Err(EngineError::Other(format!("layer \"{}\" is locked", l.name)));
     }
-    let is_smart = matches!(s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content), Some(LayerContent::Smart(_)));
+    let LayerContent::Text(t) = &mut l.content else { return Err(EngineError::Other("not a type layer".into())) };
+    t.warp = tw.clone();
+    crate::type_cmds::refresh(snapshot, t);
+    Ok(())
+}
+
+fn apply(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
+    let (ids, rect) = target(s, cmd, p)?;
+    let w = warp_from_params(cmd, p, rect_f(rect))?;
+    let kind = |id: LayerId| s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content);
+    if ids.len() == 1 && matches!(kind(ids[0]), Some(LayerContent::Text(_))) {
+        return warp_type_layer(s, cmd, ids[0], &w);
+    }
+    let is_smart = ids.iter().any(|&id| matches!(kind(id), Some(LayerContent::Smart(_))));
     if w.is_identity() && !is_smart {
-        return Ok(json!({"layer": id.0, "changed": false}));
+        return Ok(json!({"layer": ids[0].0, "changed": false}));
     }
     let interp = Interp::parse(p.get("interpolation").and_then(Value::as_str).unwrap_or("bicubic"));
     let content_knots = p.get("mesh").is_some() && p.get("warp").is_none();
+    // A type layer in the set takes the Warp Text style instead of a mesh warp (#3004).
+    let tw = ids.iter().any(|&id| matches!(kind(id), Some(LayerContent::Text(_)))).then(|| type_warp(cmd, &w)).transpose()?;
     s.edit("Warp", |doc, _| {
         let sel = doc.selection.clone();
         let frames = content_knots.then(|| {
             let mut f = Frames::new();
-            if let Some(l) = doc.layer(id) {
-                source_frames(doc, l, &mut f);
+            for &id in &ids {
+                if let Some(l) = doc.layer(id) {
+                    source_frames(doc, l, &mut f);
+                }
             }
             f
         });
-        let is_group = doc.layer(id).is_some_and(Layer::is_group);
-        let group = crate::transform_cmds::group_locks(doc, id);
-        crate::extra_cmds::background_to_layer(doc, id);
-        let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        warp_layer(if is_group { None } else { sel.as_ref() }, group, l, &w, rect, interp, frames.as_ref())?;
+        for &id in &ids {
+            let is_group = doc.layer(id).is_some_and(Layer::is_group);
+            let group = crate::transform_cmds::group_locks(doc, id);
+            crate::extra_cmds::background_to_layer(doc, id);
+            if matches!(doc.layer(id).map(|l| &l.content), Some(LayerContent::Text(_))) {
+                let snapshot = doc.clone();
+                set_type_warp(doc, &snapshot, id, &tw.clone().flatten())?;
+            } else {
+                let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+                warp_layer(if is_group { None } else { sel.as_ref() }, group, l, &w, rect, interp, frames.as_ref())?;
+            }
+        }
         let snapshot = doc.clone();
-        if let Some(l) = doc.layer_mut(id) {
-            crate::transform_cmds::refresh_text(&snapshot, l);
+        for &id in &ids {
+            if let Some(l) = doc.layer_mut(id) {
+                crate::transform_cmds::refresh_text(&snapshot, l);
+            }
         }
         if let Some(sel) = &doc.selection {
             doc.selection = Some(warp_mesh_gray(sel, &|x, y| w.map(x, y), Interp::Bilinear)).filter(|s| !s.content_bounds().is_empty());
         }
         Ok(())
     })?;
-    Ok(json!({"layer": id.0, "changed": true, "rect": [rect.x0, rect.y0, rect.x1, rect.y1]}))
+    Ok(json!({"layers": ids.iter().map(|l| l.0).collect::<Vec<_>>(), "changed": true, "rect": [rect.x0, rect.y0, rect.x1, rect.y1]}))
 }
 
 #[derive(Clone, Copy)]
@@ -546,7 +594,7 @@ fn grid(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const P: &str = r##"{"layer":id?,"rect":[x0,y0,x1,y1]? (warp box; default = layer content ∩ selection),"style":"custom|none|arc|arcLower|arcUpper|arch|bulge|shellLower|shellUpper|flag|wave|fish|rise|fisheye|inflate|squeeze|twist","bend":%=50,"hDistort":%,"vDistort":%,"vertical":bool,"mesh":{"us":[0,…,1],"vs":[0,…,1],"points":[[x,y]…]} ((3c+1)×(3r+1) control points, row-major, document px; on a smart object `us`/`vs` span the source contents, so points equal to the placement are an identity warp even when it is skewed),"grid":[cols,rows]?,"warp":{full warp object}?,"interpolation":"bicubic|bilinear|nearest"} — on a type layer a style (or none) sets its Warp Text and the type stays editable"##;
+    const P: &str = r##"{"layer":id?,"layers":[id,…]? (a multi-selection warps together),"rect":[x0,y0,x1,y1]? (warp box; default = layer content ∩ selection),"style":"custom|none|arc|arcLower|arcUpper|arch|bulge|shellLower|shellUpper|flag|wave|fish|rise|fisheye|inflate|squeeze|twist","bend":%=50,"hDistort":%,"vDistort":%,"vertical":bool,"mesh":{"us":[0,…,1],"vs":[0,…,1],"points":[[x,y]…]} ((3c+1)×(3r+1) control points, row-major, document px; on a smart object `us`/`vs` span the source contents, so points equal to the placement are an identity warp even when it is skewed),"grid":[cols,rows]?,"warp":{full warp object}?,"interpolation":"bicubic|bilinear|nearest"} — on a type layer a style (or none) sets its Warp Text and the type stays editable"##;
     const S: &str = r##"{"warp":{…}? (the warp being edited; returned split),"rect":[x0,y0,x1,y1]?,"at":[x,y]? (document point; default = middle of the patch)} — without `warp`, edits the active smart object's warp. A 1×1 custom mesh is divided at the thirds first (the guides drawn on the default grid), so splitWarpCrosswise on an identity custom warp returns a 4×4 mesh (knots at 0, 1/3, 1/2, 2/3 and 1), not a 2×2. A preset is fitted as one patch and split without that step."##;
     const G: &str = r##"{"warp":{…}? (the warp being edited; returned with the new mesh),"rect":[x0,y0,x1,y1]?,"size":n|"default"|"3"|"4"|"5" (square patches, 1..=64; 1 and "default" are the single-patch grid)} — without `warp`/`style`/`mesh`, edits the active smart object's warp. The surface is kept and the new lines are real splits at i/n."##;
     vec![

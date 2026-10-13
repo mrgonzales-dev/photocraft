@@ -4338,17 +4338,24 @@ pub(crate) fn layer_edges_rect(app: &PhotocraftApp, idx: usize) -> Option<photoc
     Some(b.translate(dx, dy))
 }
 
-/// Move tool › Show Transform Controls: the active layer's transform bounds.
+/// Move tool › Show Transform Controls: the selected layers' transform bounds (their union when
+/// several are selected, as the ⌘T box then is too).
 fn transform_controls_rect(app: &PhotocraftApp, xf: &ViewXform) -> Option<Rect> {
     if app.ui.tool != Tool::Move || !app.ui.tool_options.move_show_transform || app.ui.transform.is_some() || app.drag.is_some() {
         return None;
     }
     let st = app.session.active()?;
     let l = st.active_layer.and_then(|id| st.doc.layer(id))?;
-    if crate::doc_props_ui::is_background(&st.doc, l) {
+    if crate::doc_props_ui::is_background(&st.doc, l) && st.selected_layers().len() <= 1 {
         return None;
     }
-    let b = photocraft_engine::transform_cmds::transform_bounds(&st.doc, l);
+    let b = st
+        .selected_layers()
+        .iter()
+        .filter_map(|&id| st.doc.layer(id))
+        .filter(|l| !crate::doc_props_ui::is_background(&st.doc, l))
+        .map(|l| photocraft_engine::transform_cmds::transform_bounds(&st.doc, l))
+        .fold(photocraft_geom::Rect::EMPTY, |a, b| a.union(&b));
     let (dx, dy) = crate::move_ui::floating_offset(app).unwrap_or((0, 0));
     let b = b.translate(dx, dy);
     if b.is_empty() {

@@ -138,11 +138,16 @@ pub fn disabled(app: &crate::PhotocraftApp, id: &str) -> bool {
             | "edit.transform.splitWarpHorizontally"
             | "edit.transform.splitWarpVertically"
             | "edit.transform.removeWarpSplit"
-    ) && active.is_some_and(|l| matches!(l.content, LayerContent::Text(_)))
+    ) && st.selected_layers().iter().filter_map(|id| st.doc.layer(*id)).any(|l| matches!(l.content, LayerContent::Text(_)))
         && photocraft_engine::transform_cmds::lone_target(&st.doc, st.active_layer, &serde_json::json!({ "target": crate::canvas::paint_target(app) }))
             .is_ok_and(|t| t.is_none())
     {
         return true;
+    }
+    // ⌘T on a multi-selection moves every selected layer: greyed only when each of them would be
+    // (the Background in the set must not grey it for the others).
+    if transform && st.selected_layers().len() > 1 {
+        return st.selected_layers().iter().filter_map(|id| st.doc.layer(*id)).all(|l| disabled_for(&st.doc, Some(l), id));
     }
     // Only these commands depend on the selection; skip walking the layers for the rest.
     if selection_targets(id).is_some() {

@@ -547,23 +547,42 @@ fn with_panel_target(s: &Session, p: &Value) -> Value {
 fn transform(s: &mut Session, p: &Value) -> Result<Value> {
     let p = &with_panel_target(s, p);
     let st = s.active().ok_or(EngineError::NoDocument)?;
+    // Several layers transform together (`"layers"`, Free Transform with a multi-selection);
+    // a lone mask or channel transforms by itself only when a single layer is targeted.
+    let listed: Vec<LayerId> = p.get("layers").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(LayerId).collect()).unwrap_or_default();
+    for id in &listed {
+        st.doc.layer(*id).ok_or(EngineError::NoLayer(*id))?;
+    }
+    // A group in the set carries its children: drop repeats and listed descendants, or those
+    // layers transform twice.
+    let mut listed: Vec<LayerId> =
+        listed.iter().copied().filter(|&id| !listed.iter().any(|&o| o != id && st.doc.layer(o).is_some_and(|g| holds(g, id)))).collect();
+    listed.sort_unstable();
+    listed.dedup();
     let id = crate::commands::explicit_layer(s, p)?.or(st.active_layer);
-    let lone = lone_target(&st.doc, id, p)?;
-    let id = match (id, lone.is_some() && crate::channel_cmds::is_channel_target(p)) {
-        (_, true) => None,
-        (Some(id), false) => Some(id),
-        (None, false) => return Err(EngineError::Other("no active layer".into())),
+    let lone = if listed.is_empty() { lone_target(&st.doc, id, p)? } else { None };
+    let (lone_id, ids): (Option<LayerId>, Vec<LayerId>) = if !listed.is_empty() {
+        (None, listed)
+    } else if lone.is_some() && crate::channel_cmds::is_channel_target(p) {
+        (None, Vec::new())
+    } else {
+        match id {
+            Some(id) => (Some(id), vec![id]),
+            None => (None, Vec::new()),
+        }
     };
+    if lone.is_none() && ids.is_empty() {
+        return Err(EngineError::Other("no active layer".into()));
+    }
     let rect = match p.get("rect").and_then(Value::as_array) {
         Some(r) if r.len() == 4 => {
             let v: Vec<f64> = r.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect();
             [v[0], v[1], v[2], v[3]]
         }
         _ => {
-            let b = match (lone, id) {
-                (Some(surf), _) => target_bounds(&st.doc, surf),
-                (None, Some(id)) => transform_bounds(&st.doc, st.doc.layer(id).ok_or(EngineError::NoLayer(id))?),
-                (None, None) => Rect::EMPTY,
+            let b = match lone {
+                Some(surf) => target_bounds(&st.doc, surf),
+                None => ids.iter().filter_map(|id| st.doc.layer(*id)).map(|l| transform_bounds(&st.doc, l)).fold(Rect::EMPTY, |a, b| a.union(&b)),
             };
             if b.is_empty() {
                 return Err(EngineError::Other("nothing to transform".into()));
@@ -599,16 +618,24 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
     crate::jobs::edit_job(
         s,
         "Free Transform",
-        move |doc, _, ctx| ctx.stage(0.0, 1.0, "Transforming", |ctl| transform_doc(doc, id, &p, lone, &h, affine, interp, ctl)),
+        move |doc, _, ctx| ctx.stage(0.0, 1.0, "Transforming", |ctl| transform_doc(doc, lone_id, &ids, &p, lone, &h, affine, interp, ctl)),
         move |()| json!({"rect": rect}),
     )
 }
 
-/// The edit of [`transform`]: the layer (or a lone mask or channel) and the selection outline.
+/// `id` sits in `root`'s subtree (a group's contents).
+pub(crate) fn holds(root: &Layer, id: LayerId) -> bool {
+    root.children().is_some_and(|ch| ch.iter().any(|c| c.id == id || holds(c, id)))
+}
+
+/// The edit of [`transform`]: the layers (or a lone mask or channel) and the selection outline.
+/// `lone_id` is the layer a targeted unlinked mask belongs to (`None` for a channel or the Quick
+/// Mask); `ids` are the layers that move, every one by the same `h`.
 #[allow(clippy::too_many_arguments)]
 fn transform_doc(
     doc: &mut Document,
-    id: Option<LayerId>,
+    lone_id: Option<LayerId>,
+    ids: &[LayerId],
     p: &Value,
     lone: bool,
     h: &Homography,
@@ -624,7 +651,7 @@ fn transform_doc(
     if lone {
         // A targeted unlinked mask, alpha channel or Quick Mask transforms by itself.
         if !h.is_identity() {
-            let (surf, _) = crate::channel_cmds::target_surface(doc, id, p)?;
+            let (surf, _) = crate::channel_cmds::target_surface(doc, lone_id, p)?;
             let src = sel.as_ref().map_or_else(|| surf.content_bounds(), Surface::content_bounds);
             check_budget(src, h, "mask or channel")?;
             *surf = match &sel {
@@ -637,18 +664,21 @@ fn transform_doc(
         }
         return Ok(());
     }
-    let id = id.ok_or_else(|| EngineError::Other("no active layer".into()))?;
-    let is_group = doc.layer(id).is_some_and(Layer::is_group);
-    let group = group_locks(doc, id);
-    // Photoshop turns the Background into a normal layer before transforming it.
-    crate::extra_cmds::background_to_layer(doc, id);
-    let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-    transform_layer_with(if is_group { None } else { sel.as_ref() }, group, l, h, affine, interp, ctl)?;
+    for &id in ids {
+        let is_group = doc.layer(id).is_some_and(Layer::is_group);
+        let group = group_locks(doc, id);
+        // Photoshop turns the Background into a normal layer before transforming it.
+        crate::extra_cmds::background_to_layer(doc, id);
+        let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+        transform_layer_with(if is_group { None } else { sel.as_ref() }, group, l, h, affine, interp, ctl)?;
+    }
     if !h.is_identity() {
         // Type layers re-render from their new transform.
         let snapshot = doc.clone();
-        if let Some(l) = doc.layer_mut(id) {
-            refresh_text(&snapshot, l);
+        for &id in ids {
+            if let Some(l) = doc.layer_mut(id) {
+                refresh_text(&snapshot, l);
+            }
         }
         // The selection outline moves with the pixels.
         if let Some(sel) = &doc.selection {
@@ -664,7 +694,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "Free Transform",
         menu: &[],
         shortcut: None,
-        params: r##"{"layer":id?,"rect":[x0,y0,x1,y1]? (source frame; default = layer content ∩ selection),"quad":[[x,y]×4]? (where the frame's corners go, clockwise from top-left),"matrix":[a,b,c,d,e,f]? (affine alternative),"scaleX":%?,"scaleY":%?,"rotate":deg?,"dx":px?,"dy":px? (relative alternative: scale and rotate about the frame's centre, then move, as a Photoshop action records a Free Transform),"interpolation":"bicubic|bilinear|nearest"="bicubic","target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target (an unlinked mask, an alpha channel or the Quick Mask transforms alone; a linked mask moves with its layer)}"##,
+        params: r##"{"layer":id?,"layers":[id,…]? (several layers transform together, as Free Transform on a multi-selection does),"rect":[x0,y0,x1,y1]? (source frame; default = layer content ∩ selection),"quad":[[x,y]×4]? (where the frame's corners go, clockwise from top-left),"matrix":[a,b,c,d,e,f]? (affine alternative),"scaleX":%?,"scaleY":%?,"rotate":deg?,"dx":px?,"dy":px? (relative alternative: scale and rotate about the frame's centre, then move, as a Photoshop action records a Free Transform),"interpolation":"bicubic|bilinear|nearest"="bicubic","target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target (an unlinked mask, an alpha channel or the Quick Mask transforms alone; a linked mask moves with its layer)}"##,
         enabled: has_layer,
         journal: true,
         run: transform,
@@ -1273,5 +1303,93 @@ mod tests {
         for bad in [json!({"scaleX": 0}), json!({"rotate": "x"}), json!({"dx": f64::NAN})] {
             assert!(s.execute("edit.transform", bad.clone()).is_err(), "{bad}");
         }
+    }
+
+    // ---- Several layers transform together (`"layers"`, ⌘T on a multi-selection). ----
+
+    /// Two painted layers: `a` (x 10..30, y 10..20) below `b` (x 50..60, y 50..60).
+    /// Returns the session and both ids; `a` stays the active layer.
+    fn two_layers() -> (Session, LayerId, LayerId) {
+        let mut s = session();
+        let a = s.active().unwrap().active_layer.unwrap();
+        s.execute("layer.new.layer", json!({})).unwrap();
+        let b = s.active().unwrap().active_layer.unwrap();
+        s.edit("paint", move |doc, _| {
+            doc.layer_mut(b).unwrap().surface_mut().unwrap().fill_rect(Rect::new(50, 50, 60, 60), &[0.0, 1.0, 0.0, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+        s.execute("layer.select", json!({"layer": a.0})).unwrap();
+        (s, a, b)
+    }
+
+    fn bounds(s: &Session, id: LayerId) -> Rect {
+        s.active().unwrap().doc.layer(id).unwrap().surface().unwrap().content_bounds()
+    }
+
+    #[test]
+    fn layers_transform_together_as_one_step() {
+        let (mut s, a, b) = two_layers();
+        let steps = s.active().unwrap().history.past_len();
+        // One box over x 10..60, y 10..60, moved +20 x: both layers move by the same map.
+        s.execute("edit.transform", json!({"layers": [a.0, b.0], "rect": [10, 10, 60, 60], "quad": [[30, 10], [80, 10], [80, 60], [30, 60]]})).unwrap();
+        assert_eq!(bounds(&s, a), Rect::new(30, 10, 50, 20));
+        assert_eq!(bounds(&s, b), Rect::new(70, 50, 80, 60));
+        let st = s.active().unwrap();
+        assert_eq!(st.history.past_len(), steps + 1, "one history step for the whole set");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(bounds(&s, a), Rect::new(10, 10, 30, 20));
+        assert_eq!(bounds(&s, b), Rect::new(50, 50, 60, 60));
+    }
+
+    #[test]
+    fn layers_scale_about_the_combined_frame() {
+        let (mut s, a, b) = two_layers();
+        // Scale x by 2 about the combined frame's left edge (x = 10).
+        s.execute("edit.transform", json!({"layers": [a.0, b.0], "rect": [10, 10, 60, 60], "matrix": [2, 0, 0, 1, -10, 0], "interpolation": "nearest"}))
+            .unwrap();
+        let (ba, bb) = (bounds(&s, a), bounds(&s, b));
+        assert_eq!((ba.x0, ba.x1), (10, 50), "{ba:?}");
+        assert_eq!((bb.x0, bb.x1), (90, 110), "{bb:?}");
+    }
+
+    #[test]
+    fn layers_listing_a_group_and_its_child_moves_the_child_once() {
+        let (mut s, a, b) = two_layers();
+        s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+        let g = LayerId(s.execute("layer.groupLayers", json!({})).unwrap()["layer"].as_u64().unwrap());
+        // `a` is inside `g`: it inherits the group's transform, not a second one.
+        s.execute("edit.transform", json!({"layers": [g.0, a.0], "rect": [10, 10, 60, 60], "quad": [[30, 10], [80, 10], [80, 60], [30, 60]]})).unwrap();
+        assert_eq!(bounds(&s, a), Rect::new(30, 10, 50, 20));
+        assert_eq!(bounds(&s, b), Rect::new(70, 50, 80, 60));
+    }
+
+    #[test]
+    fn layers_fail_gracefully() {
+        let (mut s, a, b) = two_layers();
+        let quad = json!({"rect": [10, 10, 60, 60], "quad": [[30, 10], [80, 10], [80, 60], [30, 60]]});
+        let mut bad = quad.clone();
+        bad["layers"] = json!([a.0, 999]);
+        let before = s.active().unwrap().doc.clone();
+        assert!(s.execute("edit.transform", bad).is_err(), "a stale id refuses the transform");
+        assert!(s.active().unwrap().doc == before, "nothing changed");
+        // A locked layer in the set refuses it all, as ⌘T on a locked layer does (#2585).
+        s.edit("lock", move |doc, _| {
+            doc.layer_mut(b).unwrap().locks.position = true;
+            Ok(())
+        })
+        .unwrap();
+        let mut locked = quad.clone();
+        locked["layers"] = json!([a.0, b.0]);
+        assert!(s.execute("edit.transform", locked).is_err());
+        assert_eq!(bounds(&s, a), Rect::new(10, 10, 30, 20), "the unlocked layer is untouched");
+        // A non-array `layers` falls back to the active layer, as if the key were absent.
+        s.execute("edit.transform", {
+            let mut p = quad;
+            p["layers"] = json!(12);
+            p
+        })
+        .unwrap();
+        assert_eq!(bounds(&s, a), Rect::new(30, 10, 50, 20));
     }
 }
