@@ -3635,7 +3635,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
     // Untouched state makes both calls return at their cache-key check.
     if primary
         && painted.as_ref().is_some_and(|p| p.3)
-        && !(app.gpu.is_some() && crate::gpu_canvas::gpu_view_ok(flip, view.rotation, aspect) && ensure_gpu(app, idx, visible_doc_rect(&xf)))
+        && !(app.gpu.is_some() && crate::gpu_canvas::gpu_view_ok(flip, view.rotation, aspect) && ensure_gpu(app, &ctx, idx, visible_doc_rect(&xf)))
     {
         let _ = ensure_texture(app, &ctx, idx, output);
     }
