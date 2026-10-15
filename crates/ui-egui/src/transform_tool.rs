@@ -306,7 +306,9 @@ fn begin_many(app: &mut PhotocraftApp, ctx: &egui::Context, doc: Arc<Document>, 
         return Err(LOCKED.into());
     }
     let moving: Vec<LayerId> = ids.iter().copied().filter(|&l| doc.layer(l).is_some_and(|l| !tc::transform_bounds(&doc, l).is_empty())).collect();
-    let b = moving.iter().filter_map(|&l| doc.layer(l)).map(|l| tc::transform_bounds(&doc, l)).fold(photocraft_geom::Rect::EMPTY, |a, r| a.union(&r));
+    // The frame each layer would open on (the selection's bounds when it clips the layer, as the
+    // single-layer box is), joined: the Move tool's controls draw this same union (#5297).
+    let b = moving.iter().filter_map(|&l| doc.layer(l)).map(|l| tc::transform_frame(&doc, l)).filter(|r| !r.is_empty()).fold(photocraft_geom::Rect::EMPTY, |a, r| a.union(&r));
     if b.is_empty() {
         return Err("Could not transform: the selected layers are empty".into());
     }
